@@ -1,4 +1,9 @@
-"""SQLite 持久化：当前原稿 + 待确认的预览。"""
+"""SQLite 持久化：当前原稿 + 待确认的预览。
+
+预览在生成时绑定当时的原稿版本；确认在单条事务内原子地完成：
+令牌未消费、草稿与预览输入一致、原稿版本未变三个条件全部满足时，
+才覆盖原稿（版本恰好 +1）并消费令牌，任一条件不满足则整体回滚。
+"""
 
 import json
 import os
@@ -18,10 +23,11 @@ CREATE TABLE IF NOT EXISTS design (
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS preview (
-    token       TEXT PRIMARY KEY,
-    input_json  TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    token        TEXT PRIMARY KEY,
+    input_text   TEXT NOT NULL,
+    result_json  TEXT NOT NULL,
+    base_version INTEGER NOT NULL,
+    created_at   TEXT NOT NULL
 );
 """
 
@@ -37,6 +43,9 @@ DEFAULT_DESIGN = {
     "k": 2,
 }
 
+# 确认失败的原子结果：(设计稿, None) 成功；(None, 原因) 冲突
+CONSUME_REASONS = ("consumed", "mismatch", "stale")
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -51,13 +60,29 @@ class Database:
         self._init_schema()
 
     def _connect(self):
-        conn = sqlite3.connect(self.path)
+        # isolation_level=None：事务边界完全由 BEGIN/COMMIT 显式控制，
+        # 保证确认的校验与写入在同一条写事务中原子完成（也能跨进程互斥）。
+        conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def _init_schema(self):
         with self._lock, self._connect() as conn:
             conn.executescript(SCHEMA)
+            # 旧库迁移：补齐 base_version 列（旧预览无版本绑定，置空后不可确认）
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(preview)")}
+            if "base_version" not in cols:
+                conn.execute("ALTER TABLE preview RENAME TO preview_old")
+                conn.execute(
+                    "CREATE TABLE preview (token TEXT PRIMARY KEY, input_text"
+                    " TEXT NOT NULL, result_json TEXT NOT NULL, base_version"
+                    " INTEGER, created_at TEXT NOT NULL)")
+                conn.execute(
+                    "INSERT INTO preview (token, input_text, result_json,"
+                    " base_version, created_at) SELECT token, input_json,"
+                    " result_json, NULL, created_at FROM preview_old")
+                conn.execute("DROP TABLE preview_old")
             row = conn.execute("SELECT COUNT(*) AS n FROM design").fetchone()
             if row["n"] == 0:
                 conn.execute(
@@ -69,9 +94,8 @@ class Database:
                      DEFAULT_DESIGN["k"], _now()),
                 )
 
-    def get_design(self):
-        with self._lock, self._connect() as conn:
-            row = conn.execute("SELECT * FROM design WHERE id = 1").fetchone()
+    @staticmethod
+    def _row_to_design(row):
         return {
             "rows": row["rows"],
             "cols": row["cols"],
@@ -81,34 +105,74 @@ class Database:
             "version": row["version"],
         }
 
-    def save_design(self, rows, cols, grid, locks, k):
+    def get_design(self):
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM design WHERE id = 1").fetchone()
+            return self._row_to_design(row)
+
+    def save_preview(self, token, input_text, result_obj, base_version):
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE design SET rows = ?, cols = ?, grid = ?, locks = ?,"
-                " k = ?, version = version + 1, updated_at = ? WHERE id = 1",
-                (rows, cols, json.dumps(grid), json.dumps(locks), k, _now()),
-            )
-        return self.get_design()
-
-    def save_preview(self, token, input_obj, result_obj):
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO preview (token, input_json,"
-                " result_json, created_at) VALUES (?, ?, ?, ?)",
-                (token, json.dumps(input_obj), json.dumps(result_obj), _now()),
+                "INSERT OR REPLACE INTO preview (token, input_text,"
+                " result_json, base_version, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (token, input_text, json.dumps(result_obj), base_version, _now()),
             )
 
-    def get_preview(self, token):
-        with self._lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM preview WHERE token = ?", (token,)).fetchone()
-        if row is None:
-            return None
-        return {
-            "input": json.loads(row["input_json"]),
-            "result": json.loads(row["result_json"]),
-        }
+    def commit_preview(self, token, input_text):
+        """原子确认预览。
 
-    def delete_preview(self, token):
-        with self._lock, self._connect() as conn:
-            conn.execute("DELETE FROM preview WHERE token = ?", (token,))
+        成功返回 (design, None)：在同一事务内校验并执行
+            1. 令牌存在且未消费（DELETE 命中 1 行）；
+            2. 提交草稿与预览输入一致（input_text 逐字节相同）；
+            3. 预览绑定的原稿版本与当前原稿一致（未被他人确认覆盖）。
+        冲突时全部回滚、原稿不变，返回 (None, "consumed" | "mismatch" | "stale")。
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                prow = conn.execute(
+                    "SELECT input_text, result_json, base_version"
+                    " FROM preview WHERE token = ?",
+                    (token,),
+                ).fetchone()
+                if prow is None:
+                    conn.execute("ROLLBACK")
+                    return None, "consumed"
+                if prow["input_text"] != input_text:
+                    conn.execute("ROLLBACK")
+                    return None, "mismatch"
+                drow = conn.execute(
+                    "SELECT * FROM design WHERE id = 1").fetchone()
+                if prow["base_version"] != drow["version"]:
+                    conn.execute("ROLLBACK")
+                    return None, "stale"
+
+                result = json.loads(prow["result_json"])
+                grid = result["repaired"]
+                input_obj = json.loads(input_text)
+                rows, cols, locks, k = (
+                    input_obj["rows"], input_obj["cols"],
+                    input_obj["locks"], input_obj["k"])
+                conn.execute(
+                    "UPDATE design SET rows = ?, cols = ?, grid = ?, locks = ?,"
+                    " k = ?, version = version + 1, updated_at = ? WHERE id = 1",
+                    (rows, cols, json.dumps(grid), json.dumps(locks),
+                     k, _now()),
+                )
+                # 仅在条件全部满足时消费令牌；UPDATE 后删除，行锁持有到提交
+                deleted = conn.execute(
+                    "DELETE FROM preview WHERE token = ?", (token,)).rowcount
+                if deleted != 1:
+                    conn.execute("ROLLBACK")
+                    return None, "consumed"
+                drow = conn.execute(
+                    "SELECT * FROM design WHERE id = 1").fetchone()
+                conn.execute("COMMIT")
+                return self._row_to_design(drow), None
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()

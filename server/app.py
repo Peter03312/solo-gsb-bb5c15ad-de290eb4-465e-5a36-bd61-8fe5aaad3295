@@ -1,6 +1,5 @@
 """Flask 后端：原稿查询、修补预览、预览确认。"""
 
-import hashlib
 import json
 import os
 import uuid
@@ -28,9 +27,9 @@ def _design_payload(design):
     return payload
 
 
-def _fingerprint(obj):
-    text = json.dumps(obj, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _canonical_text(obj):
+    """规范化输入的逐字节序列化，用于草稿与预览输入的一致性比对。"""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
 @app.get("/api/state")
@@ -46,6 +45,7 @@ def preview():
         return jsonify({"error": str(exc)}), 400
 
     input_obj = canonical(rows, cols, grid, locks, k)
+    input_text = _canonical_text(input_obj)
     violations = find_violations(grid, rows, cols, k)
     solved = solve_repair(rows, cols, k, grid, locks)
 
@@ -63,7 +63,9 @@ def preview():
         "flipCount": len(solved["flips"]),
     }
     token = uuid.uuid4().hex
-    db.save_preview(token, input_obj, result)
+    # 预览绑定生成时的原稿版本；确认时若该版本已变则拒绝
+    base_version = db.get_design()["version"]
+    db.save_preview(token, input_text, result, base_version)
     return jsonify({
         "solvable": True,
         "token": token,
@@ -88,17 +90,18 @@ def confirm():
     except ValidationError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    stored = db.get_preview(token)
-    if stored is None:
-        return jsonify({"error": "预览不存在或已失效，请重新预览"}), 409
+    # 原子确认：令牌未消费、草稿与预览输入一致、预览绑定的原稿版本未变，
+    # 三者同时成立才覆盖原稿（版本仅 +1）并消费令牌；否则整体回滚。
+    input_text = _canonical_text(canonical(rows, cols, grid, locks, k))
+    design, reason = db.commit_preview(token, input_text)
+    if design is None:
+        message = {
+            "consumed": "预览令牌不存在或已被确认，请重新预览",
+            "mismatch": "预览后稿件已变动，旧预览已失效，请重新预览",
+            "stale": "原稿已被其他确认更新，旧预览已失效，请重新预览",
+        }[reason]
+        return jsonify({"error": message}), 409
 
-    current = canonical(rows, cols, grid, locks, k)
-    if _fingerprint(current) != _fingerprint(stored["input"]):
-        return jsonify({"error": "预览后稿件已变动，旧预览已失效，请重新预览"}), 409
-
-    result = stored["result"]
-    design = db.save_design(rows, cols, result["repaired"], locks, k)
-    db.delete_preview(token)
     return jsonify({"state": _design_payload(design)})
 
 
