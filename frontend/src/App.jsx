@@ -228,8 +228,21 @@ export default function App() {
       setPreview(null);
       setMessage({ type: "success", text: "已确认当前预览并覆盖原稿，后续编辑基于新原稿。" });
     } catch (e) {
-      setMessage({ type: "error", text: e.message });
-      if (e.status === 409) setPreview(null);
+      if (e.status === 409) {
+        // 冲突：令牌已消费 / 原稿已被他人推进 / 草稿与预览不一致。
+        // 清除旧预览、刷新原稿，但保留本地未提交草稿，提示重新预览。
+        setPreview(null);
+        try {
+          const latest = await fetchState();
+          setOriginal(latest);
+        } catch (re) {
+          setMessage({ type: "error", text: `冲突后刷新原稿失败：${re.message}` });
+          return;
+        }
+        setMessage({ type: "error", text: `${e.message}（原稿已刷新，未提交的草稿仍保留，请重新预览后再确认。）` });
+      } else {
+        setMessage({ type: "error", text: e.message });
+      }
     } finally {
       setBusy(false);
     }

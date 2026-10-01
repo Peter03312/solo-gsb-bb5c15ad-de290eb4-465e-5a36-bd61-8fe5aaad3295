@@ -1,13 +1,17 @@
 """Flask 后端：原稿查询、修补预览、预览确认。"""
 
-import hashlib
-import json
 import os
 import uuid
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from db import Database
+from db import (
+    PREVIEW_INPUT_MISMATCH,
+    PREVIEW_MISSING,
+    PREVIEW_OK,
+    PREVIEW_VERSION_CHANGED,
+    Database,
+)
 from solver import solve_repair
 from validate import ValidationError, canonical, validate_design
 from weave import find_violations
@@ -26,11 +30,6 @@ def _design_payload(design):
     payload["violations"] = find_violations(
         design["grid"], design["rows"], design["cols"], design["k"])
     return payload
-
-
-def _fingerprint(obj):
-    text = json.dumps(obj, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @app.get("/api/state")
@@ -63,7 +62,9 @@ def preview():
         "flipCount": len(solved["flips"]),
     }
     token = uuid.uuid4().hex
-    db.save_preview(token, input_obj, result)
+    # 令牌绑定生成时的原稿版本：确认时该版本必须仍为当前版本
+    base_version = db.get_design()["version"]
+    db.save_preview(token, input_obj, result, base_version)
     return jsonify({
         "solvable": True,
         "token": token,
@@ -88,18 +89,17 @@ def confirm():
     except ValidationError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    stored = db.get_preview(token)
-    if stored is None:
-        return jsonify({"error": "预览不存在或已失效，请重新预览"}), 409
-
     current = canonical(rows, cols, grid, locks, k)
-    if _fingerprint(current) != _fingerprint(stored["input"]):
+    # 原子校验：令牌未消费 + 草稿与预览输入一致 + 原稿版本未变；
+    # 全部通过才覆盖原稿（版本只递增一次）并消费令牌，否则一律拒绝
+    status, design = db.confirm_preview(token, current, rows, cols, locks, k)
+    if status == PREVIEW_OK:
+        return jsonify({"state": _design_payload(design)})
+    if status == PREVIEW_INPUT_MISMATCH:
         return jsonify({"error": "预览后稿件已变动，旧预览已失效，请重新预览"}), 409
-
-    result = stored["result"]
-    design = db.save_design(rows, cols, result["repaired"], locks, k)
-    db.delete_preview(token)
-    return jsonify({"state": _design_payload(design)})
+    if status == PREVIEW_VERSION_CHANGED:
+        return jsonify({"error": "原稿已被其他确认更新，旧预览已失效，请重新预览"}), 409
+    return jsonify({"error": "预览不存在或已失效，请重新预览"}), 409
 
 
 @app.get("/")
